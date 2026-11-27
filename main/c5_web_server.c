@@ -140,6 +140,7 @@ static uint8_t s_probe_ip[4];                       /* v11.5: ARP duplicate-addr
 static volatile bool s_probing = false;
 static volatile bool s_probe_hit = false;
 static bool c5_post_job(uint8_t job);
+static void drain_body(httpd_req_t *req, size_t left);   /* fix122 */
 static void alias_apply(const uint8_t ip[4], const uint8_t mask[4], const uint8_t gw[4], bool up);
 static bool alias_auto_pick(uint8_t out[4]);      /* v11.5.1 */
 static void mdns_announce(void);                  /* v11.7 */
@@ -198,10 +199,12 @@ static SemaphoreHandle_t s_cfg_mtx;          /* s_ov_cfg: httpd, worker, RPC tas
 /* worker task: NVS writes + live apply, never in httpd / RPC context */
 typedef enum { C5_JOB_SAVE = 1, C5_JOB_RESET, C5_JOB_CLEAR_STA, C5_JOB_ALIAS } c5_job_t;   /* v11.3 */
 static QueueHandle_t s_job_q;
+static volatile bool s_alias_dirty;   /* fix122: a dropped ALIAS job is retried, not lost */
 static c5_override_cfg_t s_pending_cfg;      /* guarded by s_cfg_mtx */
 static char s_apply_msg[96] = "idle";
 static volatile bool s_nvs_locked = false;   /* raw nvs partition restored: no NVS writes until reboot */
 static volatile bool s_flash_written = false; /* v5: OTA image or partition written: power cycle needed */
+static volatile bool s_raw_restore_bad;       /* fix123: raw partition restore was interrupted */
 static c5_override_cfg_t s_boot_cfg;          /* v5: overrides as loaded at boot (what the host applied) */
 
 /* last results of the RF profile (shown in telemetry) */
@@ -612,6 +615,9 @@ static void mdns_rx(void *arg, struct udp_pcb *pcb, struct pbuf *p,
     if (s_mdns_ifx == WIFI_IF_STA && s_alias_ready) {
         n = &s_alias_netif; ra = s_alias_ip;
     }
+    /* fix122: query from the router LAN while the alias is down - 192.168.61.250
+     * is not reachable there, do not let the client cache it for 120 s */
+    if (s_mdns_ifx == WIFI_IF_STA && !s_alias_ready) return;
     if (!netif_is_up(n)) return;
     /* v11.10: we bypass ip4_input for mDNS, so lwIP never learns the querier's
      * MAC. Ask for it explicitly - otherwise the first reply is lost. */
@@ -921,7 +927,9 @@ static void c5_worker_task(void *arg)
     uint8_t job;
     char msg[96];
     for (;;) {
-        if (xQueueReceive(s_job_q, &job, portMAX_DELAY) != pdTRUE) continue;
+        /* fix122: ARP probing can block us for ~6 s and the queue is 4 deep */
+        if (s_alias_dirty) { s_alias_dirty = false; job = C5_JOB_ALIAS; }
+        else if (xQueueReceive(s_job_q, &job, portMAX_DELAY) != pdTRUE) continue;
         switch (job) {
         case C5_JOB_SAVE: {
             c5_override_cfg_t old, c;
@@ -969,6 +977,11 @@ static void c5_worker_task(void *arg)
             cfg_unlock();
             c5_apply_rf_profile();
             c5_apply_tx_power();
+            /* fix122: nvs_erase_all() removed al_ip/al_mask/al_gw - drop the RAM copy too */
+            memset(s_alias_cfg_ip, 0, 4);
+            memset(s_alias_gw, 0, 4);
+            s_alias_mask[0] = 255; s_alias_mask[1] = 255; s_alias_mask[2] = 255; s_alias_mask[3] = 0;
+            c5_post_job(C5_JOB_ALIAS);
             snprintf(msg, sizeof(msg), "Overrides cleared (%s)", esp_err_to_name(e));
             set_apply_msg(msg);
             break;
@@ -1025,7 +1038,10 @@ static void c5_worker_task(void *arg)
 
 static bool c5_post_job(uint8_t job)
 {
-    return s_job_q && xQueueSend(s_job_q, &job, 0) == pdTRUE;
+    if (!s_job_q) return false;
+    if (xQueueSend(s_job_q, &job, 0) == pdTRUE) return true;
+    if (job == C5_JOB_ALIAS) s_alias_dirty = true;   /* fix122 */
+    return false;
 }
 /* ---------- private lwIP netif ---------- */
 
@@ -1055,8 +1071,14 @@ static bool ui_frame_is_for_host(const uint8_t *f, uint16_t len)
     return (f[0] & 1) && len >= 42 && f[12] == 0x08 && f[13] == 0x06 && memcmp(&f[38], hip, 4) == 0;
 }
 
+extern volatile uint8_t datapath;   /* esp_hosted_coprocessor.c */
+
 static err_t ui_to_host(struct pbuf *p)
 {
+    /* fix122: BYPASS_TX_PRIORITY_Q=1 -> process_tx_pkt() runs in OUR context and
+     * does vTaskDelay(100 ms) when the data path is closed (host is rebooting).
+     * That would stall the whole tcpip thread, i.e. the web UI. */
+    if (!datapath) return ERR_IF;
     uint8_t *f = malloc(p->tot_len);
     if (!f) return ERR_MEM;
     pbuf_copy_partial(p, f, p->tot_len, 0);
@@ -1187,7 +1209,10 @@ static bool alias_auto_pick(uint8_t out[4])
 
 static void alias_apply(const uint8_t ip[4], const uint8_t mask[4], const uint8_t gw[4], bool up)
 {
-    alias_job_t j;
+    /* fix122: tcpip_callback_with_block(...,1) blocks on POST, not on execution:
+     * the tcpip thread reads this job after we return -> it must not live on our stack.
+     * Called from the worker task only, so one static instance is enough. */
+    static alias_job_t j;
     memset(&j, 0, sizeof(j));
     if (ip) memcpy(j.ip, ip, 4);
     if (mask) memcpy(j.mask, mask, 4);
@@ -1446,7 +1471,7 @@ static esp_err_t h_telemetry(httpd_req_t *req)
         "{\"temp\":%s,\"tmax\":%s,\"free_kb\":%lu,\"min_kb\":%lu,\"cur_ota\":\"%s\",\"nxt_ota\":\"%s\","
         "\"ch\":%u,\"sec\":%d,\"bw\":%d,\"perr\":\"%s\",\"pwr\":%.1f,\"cli\":%d,\"rssi\":%d,"
         "\"hpkt\":%lu,\"upkt\":%lu,\"up\":%lld,\"need\":%d,"
-        "\"heap_free\":%lu,\"heap_min\":%lu,\"heap_lfb\":%lu,\"lm_drop\":%lu,\"lm_wait\":%lu}",
+        "\"heap_free\":%lu,\"heap_min\":%lu,\"heap_lfb\":%lu,\"lm_drop\":%lu,\"lm_wait\":%lu,\"rbad\":%d}",
         temp_s, tmax_s,
         (unsigned long)(hf / 1024),
         (unsigned long)(hm / 1024),
@@ -1455,7 +1480,8 @@ static esp_err_t h_telemetry(httpd_req_t *req)
         ch, (int)sec, bw_mhz, esp_err_to_name(s_prof_err), pwr / 4.0f, cli_num, avg_rssi,
         (unsigned long)s_host_pkts, (unsigned long)s_ui_pkts,
         (long long)(esp_timer_get_time() / 1000000ULL), need,
-        (unsigned long)hf, (unsigned long)hm, (unsigned long)hl, (unsigned long)s_lm_drop, (unsigned long)s_lm_wait);
+        (unsigned long)hf, (unsigned long)hm, (unsigned long)hl, (unsigned long)s_lm_drop, (unsigned long)s_lm_wait,
+        s_raw_restore_bad ? 1 : 0);   /* fix123 */
 
     httpd_resp_set_type(req, "application/json; charset=utf-8");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
@@ -1511,10 +1537,13 @@ static esp_err_t h_speedtest(httpd_req_t *req)
     }
 }
 
-static void url_decode(char *dst, const char *src, size_t max_len)
+/* fix123: returns false when the decoded value did not fit into max_len */
+static bool url_decode(char *dst, const char *src, size_t max_len)
 {
     size_t di = 0;
-    for (size_t si = 0; src[si] && di + 1 < max_len; si++) {
+    bool truncated = false;
+    for (size_t si = 0; src[si]; si++) {
+        if (di + 1 >= max_len) { truncated = true; break; }
         if (src[si] == '%' && src[si + 1] && src[si + 2]) {
             char hex[3] = { src[si + 1], src[si + 2], 0 };
             char *end = NULL;
@@ -1533,6 +1562,7 @@ static void url_decode(char *dst, const char *src, size_t max_len)
         }
     }
     dst[di] = 0;
+    return !truncated;   /* fix123 */
 }
 
 static void json_escape(char *dst, const char *src, size_t max_len)
@@ -1610,8 +1640,12 @@ static esp_err_t h_nvs(httpd_req_t *req)
     char q[512], raw[256];
     q[0] = 0;
     int cl = (int)req->content_len;
+    /* fix122: a cut body used to save a truncated SSID/password and answer "Saved" */
+    if (cl > (int)sizeof(q) - 1) {
+        drain_body(req, req->content_len);
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "settings body too long (max 511 bytes)");
+    }
     if (cl > 0) {
-        if (cl > (int)sizeof(q) - 1) cl = (int)sizeof(q) - 1;
         int got = 0;
         while (got < cl) {
             int r = httpd_req_recv(req, q + got, cl - got);
@@ -1626,10 +1660,12 @@ static esp_err_t h_nvs(httpd_req_t *req)
         esp_err_t qe;
         qe = httpd_query_key_value(q, "ssid", raw, sizeof(raw));
         if (qe == ESP_ERR_HTTPD_RESULT_TRUNC) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "SSID too long");
-        if (qe == ESP_OK) url_decode(c.ssid, raw, sizeof(c.ssid));
+        if (qe == ESP_OK && !url_decode(c.ssid, raw, sizeof(c.ssid)))   /* fix123 */
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "SSID longer than 32 bytes");
         qe = httpd_query_key_value(q, "pass", raw, sizeof(raw));
         if (qe == ESP_ERR_HTTPD_RESULT_TRUNC) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Password too long");
-        if (qe == ESP_OK) url_decode(c.pass, raw, sizeof(c.pass));
+        if (qe == ESP_OK && !url_decode(c.pass, raw, sizeof(c.pass)))   /* fix123 */
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Password longer than 63 bytes");
         if (httpd_query_key_value(q, "cc", raw, sizeof(raw)) == ESP_OK) url_decode(c.cc, raw, sizeof(c.cc));
         if (httpd_query_key_value(q, "std", raw, sizeof(raw)) == ESP_OK) c.std = (uint8_t)atoi(raw);
         if (httpd_query_key_value(q, "ch", raw, sizeof(raw)) == ESP_OK) c.ch = (uint8_t)atoi(raw);
@@ -1947,6 +1983,12 @@ static esp_err_t h_ota(httpd_req_t *req)
             drain_body(req, req->content_len);
             return send_err_text(req, HTTPD_400_BAD_REQUEST, "invalid backup size (must be 4K multiple, <= partition)", ESP_OK);
         }
+        /* fix123: a short dump erases only its first sectors and keeps the old pages
+         * behind them - half old / half new NVS is a corrupt NVS. Full dump or nothing. */
+        if (req->content_len != p->size) {
+            drain_body(req, req->content_len);
+            return send_err_text(req, HTTPD_400_BAD_REQUEST, "restore needs the whole partition dump", ESP_OK);
+        }
         esp_err_t e = esp_partition_erase_range(p, 0, req->content_len);
         if (e != ESP_OK) {
             drain_body(req, req->content_len);
@@ -1958,10 +2000,19 @@ static esp_err_t h_ota(httpd_req_t *req)
         size_t left = req->content_len;
         while (left > 0) {
             int r = recv_chunk(req, s_io_buf, left > sizeof(s_io_buf) ? sizeof(s_io_buf) : left);
-            if (r <= 0) return ESP_FAIL;
+            if (r <= 0) {
+                /* fix123: the partition is already erased / half written. app_main calls
+                 * nvs_flash_erase() on a broken NVS, so the dump must be re-uploaded
+                 * BEFORE the next power cycle. Say it in the UI instead of dropping. */
+                s_raw_restore_bad = true;
+                set_apply_msg("WARNING: restore interrupted - re-upload BEFORE power cycle!");
+                return ESP_FAIL;
+            }
             c5_heap_wait();                       /* v11.2: same guard as the other flash paths */
             e = esp_partition_write(p, off, s_io_buf, r);
             if (e != ESP_OK) {
+                s_raw_restore_bad = true;   /* fix123 */
+                set_apply_msg("WARNING: restore failed - re-upload BEFORE power cycle!");
                 drain_body(req, left - r);
                 return send_err_text(req, HTTPD_500_INTERNAL_SERVER_ERROR, "write", e);
             }
@@ -1974,6 +2025,8 @@ static esp_err_t h_ota(httpd_req_t *req)
                     if (esp_partition_read(p, off + o, vb, c) != ESP_OK || memcmp(vb, s_io_buf + o, c) != 0) bad = true;
                 }
                 if (bad) {
+                    s_raw_restore_bad = true;   /* fix123 */
+                    set_apply_msg("WARNING: restore verify failed - re-upload BEFORE power cycle!");
                     drain_body(req, left - r);
                     return send_err_text(req, HTTPD_500_INTERNAL_SERVER_ERROR, "verify after write", ESP_FAIL);
                 }
@@ -1983,6 +2036,8 @@ static esp_err_t h_ota(httpd_req_t *req)
         }
         char ok[128];
         s_flash_written = true;
+        s_raw_restore_bad = false;   /* fix123 */
+        set_apply_msg("idle");
         snprintf(ok, sizeof(ok), "Partition %s restored (%u bytes). Power-cycle the VNCI to use it.",
                  target, (unsigned)off);
         return httpd_resp_sendstr(req, ok);
@@ -2530,6 +2585,9 @@ static esp_err_t h_reboot(httpd_req_t *req)
 }
 
 typedef struct { SemaphoreHandle_t done; } netif_setup_ctx_t;
+/* fix122: static ctx + semaphore, never freed: a callback that runs after our
+ * 5 s wait must still find valid memory (it used to touch a dead task stack). */
+static netif_setup_ctx_t s_netif_ctx;
 
 static void netif_setup_cb(void *arg)
 {
@@ -2556,11 +2614,10 @@ static void ui_server_task(void *arg)
 
     /* 1. TCP/IP thread (no-op if already running) + our netif, inside tcpip thread */
     if (esp_netif_init() == ESP_OK) {
-        netif_setup_ctx_t ctx = { .done = xSemaphoreCreateBinary() };
-        if (ctx.done && tcpip_callback(netif_setup_cb, &ctx) == ERR_OK) {
-            xSemaphoreTake(ctx.done, pdMS_TO_TICKS(5000));
+        if (!s_netif_ctx.done) s_netif_ctx.done = xSemaphoreCreateBinary();
+        if (s_netif_ctx.done && tcpip_callback(netif_setup_cb, &s_netif_ctx) == ERR_OK) {
+            xSemaphoreTake(s_netif_ctx.done, pdMS_TO_TICKS(5000));
         }
-        if (ctx.done) vSemaphoreDelete(ctx.done);
     }
 
     /* 2. HTTP server: sockets = max_open_sockets + 3 must be <= CONFIG_LWIP_MAX_SOCKETS */
