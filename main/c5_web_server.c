@@ -426,6 +426,37 @@ static void c5_apply_country(const char *cc)
     }
 }
 
+/* v11.11: when the user pins a channel, the band follows from it (ch>=36 -> 5 GHz).
+ * The host likes to re-assert its own band mode / channel after us, so this is also
+ * re-run from the host RPC hook. Never fight the web scan, and never touch the band
+ * while a STA uplink owns the channel. */
+static void c5_apply_band_override(void)
+{
+    if (s_web_scan_active || s_scan_band_switched) return;
+
+    c5_override_cfg_t c;
+    cfg_get(&c);
+    if (c.ch == 0) return;                      /* auto channel: host decides */
+
+    wifi_mode_t mode = WIFI_MODE_NULL;
+    if (esp_wifi_get_mode(&mode) != ESP_OK) return;
+    if (mode != WIFI_MODE_AP && mode != WIFI_MODE_APSTA) return;
+    if (mode == WIFI_MODE_APSTA && sta_is_connected()) return;
+
+    wifi_band_mode_t want = (c.ch >= 36) ? WIFI_BAND_MODE_5G_ONLY : WIFI_BAND_MODE_2G_ONLY;
+    wifi_band_mode_t cur = WIFI_BAND_MODE_AUTO;
+    if (esp_wifi_get_band_mode(&cur) == ESP_OK && cur != want) {
+        (void)esp_wifi_set_band_mode(want);
+    }
+
+    uint8_t ch = 0;
+    wifi_second_chan_t sec = WIFI_SECOND_CHAN_NONE;
+    if (esp_wifi_get_channel(&ch, &sec) == ESP_OK && ch != c.ch) {
+        (void)esp_wifi_set_channel(c.ch, WIFI_SECOND_CHAN_NONE);
+        c5_fix_ht40_second();                   /* restore HT40 secondary if needed */
+    }
+}
+
 /* called from req_wifi_start() right BEFORE esp_wifi_start(): AP comes up with the profile */
 void c5_before_wifi_start(void)
 {
@@ -443,6 +474,7 @@ void c5_on_wifi_started(void)
     c5_apply_country(c.cc);
     (void)esp_wifi_set_ps(WIFI_PS_NONE);
     c5_apply_rf_profile();
+    c5_apply_band_override();      /* v11.11 */
     c5_apply_tx_power();          /* last: country change resets the power limit */
 }
 
@@ -465,7 +497,8 @@ bool c5_webui_scan_band_mode(wifi_band_mode_t *band_mode)
 
 void c5_webui_host_band_changed(void)
 {
-    if (s_scan_band_switched) s_host_band_changed = true;
+    if (s_scan_band_switched) { s_host_band_changed = true; return; }
+    c5_apply_band_override();   /* v11.11: pinned channel beats the host */
 }
 
 static void c5_wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -514,10 +547,20 @@ static struct udp_pcb *s_mdns_pcb;
 static esp_timer_handle_t s_mdns_timer;   /* v11.7: periodic announcement */
 static volatile bool s_mdns_up;
 static uint32_t s_mdns_q, s_mdns_resp;
+static uint32_t s_mdns_txerr;                      /* v11.9 */
+static wifi_interface_t s_mdns_ifx = WIFI_IF_AP;   /* v11.9 */
 
-static bool ip4_same_subnet(const uint8_t *a, const uint8_t *b, const uint8_t *m)
+static bool __attribute__((unused)) ip4_same_subnet(const uint8_t *a, const uint8_t *b, const uint8_t *m)
 {
     for (int i = 0; i < 4; i++) if ((a[i] & m[i]) != (b[i] & m[i])) return false;
+    return true;
+}
+
+static bool mdns_label_eq(const uint8_t *p, const char *lit, uint8_t len)
+{
+    for (uint8_t i = 0; i < len; i++) {
+        if ((uint8_t)(p[i] | 0x20) != (uint8_t)lit[i]) return false;
+    }
     return true;
 }
 
@@ -531,43 +574,58 @@ static void mdns_rx(void *arg, struct udp_pcb *pcb, struct pbuf *p,
     pbuf_copy_partial(p, q, ql, 0);
     pbuf_free(p);
 
-    if (q[2] & 0x80) return;                              /* response, not query */
-    if (((uint16_t)q[4] << 8 | q[5]) != 1) return;        /* one question */
+    if (q[2] & 0x80) return;                              /* a response, not a query */
+    uint16_t qd = ((uint16_t)q[4] << 8) | q[5];
+    if (!qd || qd > 8) return;
     size_t o = 12;
-    if (o >= ql || q[o] != 4 || o + 1 + 4 + 1 + 5 + 1 + 4 > ql) return;
-    if (memcmp(&q[o + 1], C5_MDNS_NAME, 4) != 0) return;
-    o += 5;
-    if (q[o] != 5 || memcmp(&q[o + 1], "local", 5) != 0) return;
-    o += 6;
-    if (q[o] != 0) return;
-    o += 1;
-    if (o + 4 > ql) return;
-    uint16_t qtype = ((uint16_t)q[o] << 8) | q[o + 1];
-    uint16_t qclass = ((uint16_t)q[o + 2] << 8) | q[o + 3];
-    if ((qtype != 1 && qtype != 255) || (qclass & 0x7FFF) != 1) return; /* A/ANY / IN */
-    o += 4;
-
-    const uint8_t *qa = (const uint8_t *)&ip_2_ip4(addr)->addr;
-    static const uint8_t fixed[4] = { C5_UI_IP_B0, C5_UI_IP_B1, C5_UI_IP_B2, C5_UI_IP_B3 };
-    static const uint8_t fixed_mask[4] = { 255, 255, 255, 0 };
-    struct netif *n = NULL;
-    const uint8_t *ra = NULL;
-    if (s_alias_ready && ip4_same_subnet(qa, s_alias_ip, s_alias_mask)) {
-        n = &s_alias_netif; ra = s_alias_ip;
-    } else if (ip4_same_subnet(qa, fixed, fixed_mask)) {
-        n = &s_lwip_netif; ra = fixed;
-    } else {
-        return;                                           /* not on a link we serve */
+    size_t name_at = 0;
+    uint16_t qclass = 0;
+    int hit = 0;
+    for (int i = 0; i < (int)qd; i++) {
+        size_t ns = o;
+        int match = 1, lab = 0;
+        while (o < ql) {
+            uint8_t l = q[o];
+            if (!l) { o++; break; }
+            if ((l & 0xC0) || (o + 1 + l > ql)) { o = ql; break; }
+            if (lab == 0) { if (l != 4 || !mdns_label_eq(&q[o + 1], C5_MDNS_NAME, 4)) match = 0; }
+            else if (lab == 1) { if (l != 5 || !mdns_label_eq(&q[o + 1], "local", 5)) match = 0; }
+            else match = 0;
+            lab++;
+            o += 1 + l;
+        }
+        if (lab != 2) match = 0;
+        if (o + 4 > ql) return;
+        uint16_t qt = ((uint16_t)q[o] << 8) | q[o + 1];
+        uint16_t qc = ((uint16_t)q[o + 2] << 8) | q[o + 3];
+        o += 4;
+        if (match && (qt == 1 || qt == 255) && (qc & 0x7FFF) == 1) {
+            hit = 1; qclass = qc; name_at = ns;
+        }
     }
+    if (!hit) return;
 
-    uint8_t r[128];
+    /* v11.9: choose the netif by the interface the query arrived on, not by the
+     * querier's subnet - AP clients may sit in a different DHCP pool. */
+    struct netif *n = &s_lwip_netif;
+    const uint8_t *ra = s_ui_ip_fixed;
+    if (s_mdns_ifx == WIFI_IF_STA && s_alias_ready) {
+        n = &s_alias_netif; ra = s_alias_ip;
+    }
+    if (!netif_is_up(n)) return;
+    /* v11.10: we bypass ip4_input for mDNS, so lwIP never learns the querier's
+     * MAC. Ask for it explicitly - otherwise the first reply is lost. */
+    etharp_request(n, ip_2_ip4(addr));
+
+    uint8_t r[192];
     if (o + 16 > sizeof(r)) return;
     memcpy(r, q, o);                                      /* header + question */
     r[2] = 0x84; r[3] = 0x00;                             /* QR + AA */
     r[6] = 0; r[7] = 1;                                   /* ANCOUNT = 1 */
     r[8] = r[9] = r[10] = r[11] = 0;
     size_t nlen = o;
-    r[nlen++] = 0xC0; r[nlen++] = 0x0C;                   /* name pointer to question */
+    r[nlen++] = (uint8_t)(0xC0 | (name_at >> 8));
+    r[nlen++] = (uint8_t)(name_at & 0xFF);   /* pointer to the matched question */
     r[nlen++] = 0; r[nlen++] = 1;                         /* A */
     r[nlen++] = 0x80; r[nlen++] = 0x01;                     /* IN + cache flush */
     r[nlen++] = 0; r[nlen++] = 0; r[nlen++] = 0; r[nlen++] = 120;
@@ -577,15 +635,17 @@ static void mdns_rx(void *arg, struct udp_pcb *pcb, struct pbuf *p,
     struct pbuf *rp = pbuf_alloc(PBUF_TRANSPORT, nlen, PBUF_RAM);
     if (!rp) return;
     pbuf_take(rp, r, nlen);
-    s_mdns_resp++;
+    err_t e = ERR_OK;
     if (qclass & 0x8000) {                                /* QU: unicast reply */
-        udp_sendto_if(s_mdns_pcb, rp, addr, port, n);
+        e = udp_sendto_if(s_mdns_pcb, rp, addr, port, n);
     } else {
         ip_addr_t dst;
         ip_addr_set_ip4_u32(&dst, lwip_htonl(0xE00000FB)); /* 224.0.0.251 */
-        udp_sendto_if(s_mdns_pcb, rp, &dst, 5353, n);
-        udp_sendto_if(s_mdns_pcb, rp, addr, port, n);
+        e = udp_sendto_if(s_mdns_pcb, rp, &dst, 5353, n);
+        err_t e2 = udp_sendto_if(s_mdns_pcb, rp, addr, port, n);
+        if (e != ERR_OK) e = e2;
     }
+    if (e == ERR_OK) s_mdns_resp++; else s_mdns_txerr++;
     pbuf_free(rp);
 }
 
@@ -634,6 +694,7 @@ static void mdns_direct_cb(void *arg)
     if (!s_mdns_pcb) mdns_start_cb(NULL);
     if (s_mdns_pcb && j->p) {
         s_active_wifi_if = j->ifx;
+        s_mdns_ifx = j->ifx;              /* v11.9 */
         s_mdns_q++;
         mdns_rx(NULL, s_mdns_pcb, j->p, &j->addr, j->port);
         j->p = NULL;                    /* mdns_rx freed it */
@@ -652,6 +713,10 @@ static void mdns_rx_frame(const uint8_t *f, uint16_t len, wifi_interface_t ifx)
     uint16_t ulen = (uint16_t)((f[udp + 4] << 8) | f[udp + 5]);
     if (ulen < 8 + 12 || len < udp + ulen) return;
     uint16_t dns_len = (uint16_t)(ulen - 8);
+    /* v11.10: cheap filter before any allocation - most mDNS traffic is foreign */
+    if (dns_len < 12) return;
+    if (f[udp + 8 + 2] & 0x80) return;
+    if (!(((uint16_t)f[udp + 8 + 4] << 8) | f[udp + 8 + 5])) return;
 
     if (s_mdns_job_busy) return;
     mdns_job_t *j = &s_mdns_job;
@@ -881,6 +946,7 @@ static void c5_worker_task(void *arg)
                 }
                 if (old.std != c.std) c5_apply_rf_profile();
                 c5_apply_tx_power();
+                c5_apply_band_override();   /* v11.11 */
             }
             bool later = strcmp(old.ssid, c.ssid) || strcmp(old.pass, c.pass) || old.ch != c.ch;
             snprintf(msg, sizeof(msg), "Saved. Radio applied now (%s)%s",
@@ -1077,6 +1143,7 @@ static void alias_apply_cb(void *arg)                 /* tcpip thread */
     memcpy(s_alias_netif.hwaddr, s_lwip_netif.hwaddr, 6);
     netif_set_link_up(&s_alias_netif);
     netif_set_up(&s_alias_netif);
+    etharp_gratuitous(&s_alias_netif);   /* v11.10 */
 }
 
 /* v11.5: RFC5227-style ARP probe - is this address already taken on the router LAN? */
@@ -1539,9 +1606,23 @@ static esp_err_t h_nvs(httpd_req_t *req)
      * no C5 reboot: the VNCI host does not re-attach a rebooted slave) */
     c5_override_cfg_t c;
     cfg_get(&c);
-    /* v11.2: URL-encoded ssid/pass can be 3x longer than the value itself */
+    /* v11.10: secrets arrive in the POST body, not in the URL (history / Referer). */
     char q[512], raw[256];
-    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
+    q[0] = 0;
+    int cl = (int)req->content_len;
+    if (cl > 0) {
+        if (cl > (int)sizeof(q) - 1) cl = (int)sizeof(q) - 1;
+        int got = 0;
+        while (got < cl) {
+            int r = httpd_req_recv(req, q + got, cl - got);
+            if (r <= 0) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body read failed");
+            got += r;
+        }
+        q[got] = 0;
+    } else {
+        httpd_req_get_url_query_str(req, q, sizeof(q));
+    }
+    {
         esp_err_t qe;
         qe = httpd_query_key_value(q, "ssid", raw, sizeof(raw));
         if (qe == ESP_ERR_HTTPD_RESULT_TRUNC) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "SSID too long");
@@ -2316,7 +2397,7 @@ static esp_err_t h_info(httpd_req_t *req)
     jb_add(&j, ",\"ui_ip\":\"%u.%u.%u.%u\",\"host_ip\":\"%u.%u.%u.%u\",\"host_ip_learned\":%d",
            uip[0], uip[1], uip[2], uip[3], hip[0], hip[1], hip[2], hip[3],
            (s_host_ip_learned || s_host_ip_sta_valid) ? 1 : 0);
-    jb_add(&j, ",\"mdns_q\":%lu,\"mdns_resp\":%lu", (unsigned long)s_mdns_q, (unsigned long)s_mdns_resp);
+    jb_add(&j, ",\"mdns_q\":%lu,\"mdns_resp\":%lu,\"mdns_txerr\":%lu", (unsigned long)s_mdns_q, (unsigned long)s_mdns_resp, (unsigned long)s_mdns_txerr);
     if (s_host_mac_ok) { mac_str(mac, s_host_mac); jb_add(&j, ",\"host_mac\":\"%s\"", mac); }
     jb_add(&j, ",\"h2w\":%lu,\"ev\":{\"ap_start\":%lu,\"ap_conn\":%lu,\"ap_disc\":%lu,\"sta_conn\":%lu,\"sta_disc\":%lu",
            (unsigned long)s_h2w_pkts, (unsigned long)s_ev_ap_start, (unsigned long)s_ev_ap_conn, (unsigned long)s_ev_ap_disc,
